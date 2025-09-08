@@ -1,0 +1,281 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+from __future__ import annotations
+import argparse, json, os, re, sys, textwrap, subprocess
+from datetime import datetime
+from pathlib import Path
+from ai_response import OpenAIResponder, OpenAIConfig
+from prompt import build_cheatsheet_prompt, build_exercises_prompt
+from helpers import (
+    ensure_dirs, safe_slug, write_text, create_exercise_files,
+    create_launcher_script, write_manifest, run_cmd
+)
+
+# --- Rich (UI) ---
+from rich.console import Console
+from rich.table import Table
+from rich.panel import Panel
+from rich.prompt import Prompt, IntPrompt, Confirm
+from rich.markdown import Markdown
+from rich.progress import Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
+from rich import box
+
+console = Console()
+
+
+# ---------- Small utilities (DRY) ----------
+
+def spinner(desc: str):
+    """Context manager for a simple Rich spinner."""
+    return Progress(
+        SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
+        TimeElapsedColumn(), transient=True, console=console
+    )
+
+def ask_openai_client() -> OpenAIResponder | None:
+    """Single interactive flow to configure an OpenAI client."""
+    if not Confirm.ask("Configurer OpenAI maintenant ? (sinon placeholders)", default=True):
+        return None
+    model = Prompt.ask("Modèle OpenAI", default="gpt-5")
+    instructions = Prompt.ask("Instructions globales", default="Tu es concis, précis, et technique.")
+    prompt_id = prompt_version = None
+    prompt_vars = None
+    if Confirm.ask("Utiliser un prompt réutilisable (dashboard) ?", default=False):
+        prompt_id = Prompt.ask("Prompt ID (dashboard)")
+        sver = Prompt.ask("Prompt version (optionnel)", default="")
+        prompt_version = sver or None
+        vars_str = Prompt.ask('Variables JSON (optionnel, ex: {"topic":"awk"})', default="")
+        try:
+            prompt_vars = json.loads(vars_str) if vars_str else None
+        except Exception as e:
+            console.print(f"[yellow]Variables JSON ignorées:[/yellow] {e}")
+    try:
+        return OpenAIResponder(OpenAIConfig(
+            model=model, instructions=instructions,
+            prompt_id=prompt_id, prompt_version=prompt_version, prompt_vars=prompt_vars
+        ))
+    except Exception as e:
+        console.print(f"[yellow]Client OpenAI non initialisé:[/yellow] {e}\n"
+                      "[yellow]Le script créera des placeholders.[/yellow]")
+        return None
+
+
+# ---------- Core orchestrator (logic only + tiny UI where helpful) ----------
+
+class ParetoLearningSystem:
+    def __init__(self, base_dir: Path | None = None, client: OpenAIResponder | None = None) -> None:
+        self.base_dir = base_dir or (Path.home() / "Developer/L3_CNAM/pareto")
+        self.client = client  # None => placeholders
+
+    def _maybe_generate(self, prompt: str) -> str | None:
+        if self.client is None:
+            return None
+        try:
+            with spinner("LLM · génération en cours…") as progress:
+                progress.add_task("gen", total=None)
+                return self.client.generate(input_text=prompt)
+        except Exception as e:
+            console.print(f"[yellow]Appel OpenAI échoué:[/yellow] {e}")
+            return None
+
+    def generate_cheatsheet(self, topic: str) -> Path:
+        topic_slug = safe_slug(topic)
+        dirs = ensure_dirs(self.base_dir, topic_slug)
+        path = dirs["cheats"] / f"{topic_slug}.md"
+        content = self._maybe_generate(build_cheatsheet_prompt(topic))
+        if not content:
+            placeholder = textwrap.dedent(f"""\
+            # {topic} — Cheat Sheet Pareto (PLACEHOLDER)
+            > OpenAI non configuré. Utilise ce prompt :
+
+            ```
+            {build_cheatsheet_prompt(topic)}
+            ```
+            """)
+            content = placeholder
+        write_text(path, content.rstrip() + "\n")
+        console.print(Panel.fit(f"Cheat sheet créé:\n[bold]{path}[/bold]", title="✅ OK"))
+        return path
+
+    def generate_exercises(self, topic: str, n: int = 5) -> list[Path]:
+        topic_slug = safe_slug(topic)
+        dirs = ensure_dirs(self.base_dir, topic_slug)
+        date_str = datetime.now().strftime("%Y-%m-%d")
+        content = self._maybe_generate(build_exercises_prompt(topic, n))
+        files = create_exercise_files(dirs["ex"], date_str, n, content)
+        launcher = create_launcher_script(dirs["ex"], topic_slug)
+
+        table = Table(title="Exercices créés", box=box.SIMPLE)
+        table.add_column("Fichier", style="cyan")
+        for p in files: table.add_row(str(p))
+        console.print(table)
+        console.print(f"[green]Lanceur:[/green] {launcher}")
+        return files
+
+    def auto_generate_full_course(self, topic: str, n: int = 5) -> None:
+        cheat = self.generate_cheatsheet(topic)
+        ex_files = self.generate_exercises(topic, n)
+        slug = safe_slug(topic)
+        manifest = write_manifest(self.base_dir, topic, slug, cheat.parent, ex_files)
+        console.print(Panel.fit(
+            f"[bold]Cheat sheet:[/bold] {cheat}\n"
+            f"[bold]Exercices:[/bold] {ex_files[0].parent}\n"
+            f"[bold]Manifest:[/bold] {manifest}",
+            title="🎯 Cours complet généré", border_style="green"))
+
+    # light helpers kept (UI minimal)
+    def create_practice_session(self, topic: str, mode: str = "guided") -> None:
+        slug = safe_slug(topic)
+        ex_dir = self.base_dir / "exercises" / slug
+        cheat = self.base_dir / "cheatsheets" / slug / f"{slug}.md"
+
+        if not ex_dir.exists():
+            console.print("[red]Pas d'exercices trouvés.[/red]")
+            return
+
+        # Préfère .md, fallback .txt si héritage
+        files = sorted(list(ex_dir.glob("*.md")))
+        if not files:
+            files = sorted(list(ex_dir.glob("*.txt")))
+        if not files:
+            console.print("[red]Aucun fichier d'exercice.[/red]")
+            return
+
+        console.print(Panel.fit(
+            f"Mode: [bold]{'Guidé' if mode=='guided' else 'Examen'}[/bold]\n"
+            f"Cheat sheet: {('disponible' if cheat.exists() else 'absent')}",
+            title="🧪 Session de pratique"))
+
+        if mode == "guided" and cheat.exists():
+            console.print(Markdown(cheat.read_text(encoding="utf-8")[:2000]))
+            if Confirm.ask("Ouvrir le cheat sheet complet dans $EDITOR ?", default=False):
+                subprocess.run([os.environ.get("EDITOR", "vi"), str(cheat)])
+
+        console.print("\n[bold]Exercices disponibles:[/bold]")
+        for i, f in enumerate(files, 1):
+            console.print(f"  {i:02d}. {f.name}")
+
+        pick = max(1, min(IntPrompt.ask("\nChoisissez un exercice (numéro)", default=1), len(files)))
+        subprocess.run([os.environ.get("EDITOR", "vi"), str(files[pick - 1])])
+
+    def list_topics(self) -> None:
+        base = self.base_dir
+        topics = sorted((base / "cheatsheets").glob("*")) if (base / "cheatsheets").exists() else []
+        table = Table(title="Sujets disponibles", box=box.SIMPLE_HEAVY)
+        table.add_column("Topic", style="cyan", no_wrap=True)
+        table.add_column("Cheat Sheet", overflow="fold")
+        table.add_column("Exercices", overflow="fold")
+        for t in topics:
+            slug = t.name
+            cheat = base / "cheatsheets" / slug / f"{slug}.md"
+            ex_dir = base / "exercises" / slug
+            table.add_row(slug, str(cheat), str(ex_dir) if ex_dir.exists() else "-")
+        console.print(table)
+
+    def review_schedule(self, topic: str) -> None:
+        slug = safe_slug(topic)
+        ex_dir = self.base_dir / "exercises" / slug
+        if not ex_dir.exists():
+            console.print("[red]Aucun exercice; génère-les d'abord.[/red]")
+            return
+
+        buckets: dict[str, list[str]] = {}
+        # Supporte .md en priorité, puis .txt
+        files = sorted(ex_dir.glob("*.md")) or sorted(ex_dir.glob("*.txt"))
+        if not files:
+            console.print("[yellow]Aucun fichier détecté.[/yellow]")
+            return
+
+        for f in files:
+            m = re.match(r"(\d{4}-\d{2}-\d{2})-ex\d{2}\.(?:md|txt)$", f.name)
+            if m:
+                buckets.setdefault(m.group(1), []).append(f.name)
+
+        if not buckets:
+            console.print("[yellow]Aucune date détectée.[/yellow]")
+            return
+
+        table = Table(title=f"Planning (approx.) pour '{slug}'", box=box.MINIMAL_DOUBLE_HEAD)
+        table.add_column("Date", style="green")
+        table.add_column("Exercices")
+        for day, names in buckets.items():
+            table.add_row(day, ", ".join(sorted(names)))
+        console.print(table)
+
+
+# ---------- CLI ----------
+
+def main() -> int:
+    home = Path.home()
+    default_base = home / "Developer/L3_CNAM/pareto"
+
+    ap = argparse.ArgumentParser(description="Pareto Learning (OpenAI)")
+    ap.add_argument("topic", nargs="?", help="Sujet à apprendre (ex: awk)")
+    ap.add_argument("-n", "--num-ex", type=int, default=5, help="Nombre d'exercices (défaut: 5)")
+    ap.add_argument("-b", "--base-dir", type=Path, default=default_base)
+    ap.add_argument("--model", default="gpt-5")
+    ap.add_argument("--instructions", default="Tu es concis, précis, et technique.")
+    ap.add_argument("--prompt-id"); ap.add_argument("--prompt-version"); ap.add_argument("--prompt-vars")
+    args = ap.parse_args()
+
+    # Build client (non-interactif)
+    client: OpenAIResponder | None = None
+    try:
+        pvars = json.loads(args.prompt_vars) if args.prompt_vars else None
+        client = OpenAIResponder(OpenAIConfig(
+            model=args.model, instructions=args.instructions,
+            prompt_id=args.prompt_id, prompt_version=args.prompt_version, prompt_vars=pvars
+        ))
+    except Exception as e:
+        console.print(f"[yellow]Client OpenAI non initialisé (placeholders utilisés) :[/yellow] {e}")
+
+    if args.topic is None and len(sys.argv) == 1:
+        # Interactive lightweight menu (single screen)
+        console.print(Panel.fit(
+            """[bold]🎓 SYSTÈME D'APPRENTISSAGE - LOI DE PARETO[/bold]
+
+1) 🚀 Cours complet  2) 📝 Cheat sheet  3) 💪 Exercices
+4) 📚 Pratiquer       5) 📊 Sujets       6) 📅 Planning
+7) ❌ Quitter
+""", border_style="cyan", title="Menu"))
+        choice = Prompt.ask("Votre choix (1-7)", choices=[str(i) for i in range(1, 8)], default="7")
+        base_dir = args.base_dir
+        if choice == "7": console.print("[bold]Au revoir! 👋[/bold]"); return 0
+        if client is None:  # Option to configure quickly if none
+            if Confirm.ask("Configurer OpenAI maintenant ? (sinon placeholders)", default=True):
+                client = ask_openai_client()
+        system = ParetoLearningSystem(base_dir=base_dir, client=client)
+
+        if choice in {"1", "2", "3", "4", "6"}:
+            topic = Prompt.ask("Sujet ?")
+        if choice == "1":
+            n = IntPrompt.ask("Combien d'exercices ?", default=5)
+            system.auto_generate_full_course(topic, n=n)
+        elif choice == "2":
+            system.generate_cheatsheet(topic)
+        elif choice == "3":
+            n = IntPrompt.ask("Combien d'exercices ?", default=5)
+            system.generate_exercises(topic, n)
+        elif choice == "4":
+            mode = Prompt.ask("Mode", choices=["g", "e"], default="g")
+            system.create_practice_session(topic, "guided" if mode == "g" else "exam")
+        elif choice == "5":
+            system.list_topics()
+        elif choice == "6":
+            system.review_schedule(topic)
+        return 0
+
+    # Non-interactif
+    topic = args.topic.strip()
+    system = ParetoLearningSystem(base_dir=args.base_dir, client=client)
+    system.auto_generate_full_course(topic, n=args.num_ex) 
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        console.print("\n[red]Interrompu.[/red]")
+        raise

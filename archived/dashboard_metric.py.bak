@@ -1,0 +1,260 @@
+from __future__ import annotations
+import os, time, subprocess, shlex
+from dataclasses import dataclass
+from typing import Iterable
+from textual.app import ComposeResult
+from textual.containers import Vertical
+from textual.reactive import reactive
+from textual.widgets import Static, DataTable
+from textual import events
+
+# Dépendance recommandée (pip install psutil)
+try:
+    import psutil
+except ImportError:  # fallback minimal via /proc (CPU seulement)
+    psutil = None
+
+@dataclass(frozen=True)
+class ServiceRow:
+    state: str
+    unit: str
+    description: str
+
+class DashboardView(Vertical):
+    """Dashboard temps réel: CPU/mémoire/charge + services systemd."""
+
+    # état simple pour filtrer les services
+    services_filter = reactive("running")  # "running" | "failed" | "all"
+
+    BINDINGS = [
+        ("r", "services_filter('running')", "Running"),
+        ("f", "services_filter('failed')",  "Failed"),
+        ("a", "services_filter('all')",     "All"),
+        ("R", "restart_selected",           "Restart service"),
+        ("S", "stop_selected",              "Stop service"),
+    ]
+
+    def compose(self) -> ComposeResult:
+        yield Static("📊 Metrics", id="dash-title")
+
+        cpu = DataTable(id="dash-cpu")
+        cpu.add_columns("Metric", "Value")
+        # lignes fixes (on met à jour la colonne Value)
+        cpu.add_rows([
+            ("Uptime", ""),
+            ("Load (1/5/15)", ""),
+            ("CPU avg %", ""),
+            ("CPU per-core %", ""),
+            ("Mem used / total", ""),
+            ("Swap used / total", ""),
+        ])
+        yield cpu
+
+        services = DataTable(id="dash-services")
+        services.add_columns("State", "Unit", "Description")
+        yield services
+
+    # --------------------- lifecycle ---------------------
+
+    def on_mount(self) -> None:
+        self.query_one("#dash-title", Static).update("📊 Metrics (active)")
+        # timers: 1 Hz pour CPU/memory, 3 Hz pour services (suffisant)
+        self._cpu_timer = self.set_interval(1.0, self._update_metrics, pause=False)
+        self._svc_timer = self.set_interval(3.0, self._update_services, pause=False)
+        # init immédiate
+        self._update_metrics()
+        self._update_services()
+
+    def on_show(self) -> None:
+        # relance les timers si besoin
+        self._cpu_timer.resume()
+        self._svc_timer.resume()
+
+    def on_hide(self) -> None:
+        # épargne CPU quand onglet inactif
+        self._cpu_timer.pause()
+        self._svc_timer.pause()
+
+    # --------------------- actions ---------------------
+
+    def action_services_filter(self, mode: str) -> None:
+        if mode not in {"running", "failed", "all"}:
+            self.notify(f"Unknown filter: {mode}", severity="error")
+            return
+        self.services_filter = mode  # trigger refresh
+
+    def watch_services_filter(self, _: str) -> None:
+        self._update_services()
+
+    def action_restart_selected(self) -> None:
+        row = self._selected_service_row()
+        if not row:
+            self.notify("No service selected.", severity="warning"); return
+        self._systemctl("restart", row.unit)
+
+    def action_stop_selected(self) -> None:
+        row = self._selected_service_row()
+        if not row:
+            self.notify("No service selected.", severity="warning"); return
+        self._systemctl("stop", row.unit)
+
+    # --------------------- updates ---------------------
+
+    def _update_metrics(self) -> None:
+        dt = self.query_one("#dash-cpu", DataTable)
+
+        # uptime
+        uptime = self._uptime_hms()
+
+        # loadavg
+        try:
+            l1, l5, l15 = os.getloadavg()
+            load_s = f"{l1:.2f} / {l5:.2f} / {l15:.2f}"
+        except OSError:
+            load_s = "N/A"
+
+        # cpu
+        if psutil:
+            cpu_avg = psutil.cpu_percent(interval=None)
+            per_core = psutil.cpu_percent(interval=None, percpu=True)
+            per_core_s = ", ".join(f"{v:.0f}%" for v in per_core)
+            vm = psutil.virtual_memory()
+            sm = psutil.swap_memory()
+            mem_s = f"{self._fmt_bytes(vm.used)}/{self._fmt_bytes(vm.total)} ({vm.percent:.0f}%)"
+            swap_s = f"{self._fmt_bytes(sm.used)}/{self._fmt_bytes(sm.total)} ({sm.percent:.0f}%)" if sm.total else "0/0 (0%)"
+        else:
+            cpu_avg = self._cpu_percent_fallback()
+            per_core_s = "N/A (psutil missing)"
+            mem_s = "N/A"
+            swap_s = "N/A"
+
+        # MAJ des cellules (ligne, colonne)
+        # lignes indexées dans l'ordre de compose()
+        dt.update_cell_at((0, 1), uptime)
+        dt.update_cell_at((1, 1), load_s)
+        dt.update_cell_at((2, 1), f"{cpu_avg:.0f}%")
+        dt.update_cell_at((3, 1), per_core_s)
+        dt.update_cell_at((4, 1), mem_s)
+        dt.update_cell_at((5, 1), swap_s)
+
+    def _update_services(self) -> None:
+        rows = self._list_systemd_services(self.services_filter)
+        dt = self.query_one("#dash-services", DataTable)
+        self._clear_rows(dt)  # ← compat partout
+        for r in rows[:200]:
+            dt.add_row(r.state, r.unit, r.description)
+    def _clear_rows(self, dt: DataTable) -> None:
+        """Efface uniquement les lignes, en restant compatible avec plusieurs versions de Textual."""
+        # 1) Nouvelles/anciennes signatures possibles
+        try:
+            # certaines versions acceptent clear(columns=False), d'autres clear()
+            try:
+                dt.clear(columns=False)   # efface les lignes seulement (si supporté)
+                return
+            except TypeError:
+                pass
+            dt.clear()  # peut effacer tout (lignes + colonnes) selon version
+            # si colonnes ont sauté, on les remet
+            if getattr(dt, "column_count", 0) == 0:
+                dt.add_columns("State", "Unit", "Description")
+            return
+        except Exception:
+            # 2) Fallback robuste : suppression ligne par ligne
+            while getattr(dt, "row_count", 0) > 0:
+                try:
+                    dt.remove_row(dt.row_count - 1)  # index
+                except Exception:
+                    break
+
+    # --------------------- helpers ---------------------
+
+    def _selected_service_row(self) -> ServiceRow | None:
+        dt = self.query_one("#dash-services", DataTable)
+        if dt.cursor_row is None or dt.row_count == 0:
+            return None
+        row = dt.get_row_at(dt.cursor_row)
+        # row -> tuple[Renderable,...] ; convertissons proprement
+        state = str(row[0].renderable) if hasattr(row[0], "renderable") else str(row[0])
+        unit =  str(row[1].renderable) if hasattr(row[1], "renderable") else str(row[1])
+        desc =  str(row[2].renderable) if hasattr(row[2], "renderable") else str(row[2])
+        return ServiceRow(state=state, unit=unit, description=desc)
+
+    def _systemctl(self, verb: str, unit: str) -> None:
+        # NB: nécessite permissions; sans sudo → échec (on affiche clairement)
+        cmd = ["systemctl", verb, unit]
+        try:
+            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            self.notify(f"{verb} {unit}: ok", severity="information")
+            # rafraîchir l’état après action
+            self._update_services()
+        except subprocess.CalledProcessError as e:
+            self.notify(f"{verb} {unit}: {e.stderr.strip() or e}", severity="error")
+
+    def _list_systemd_services(self, mode: str) -> list[ServiceRow]:
+        # --state=running|failed ou pas de filtre pour all
+        states = {
+            "running": ["running"],
+            "failed":  ["failed"],
+            "all":     None,
+        }[mode]
+        base = ["systemctl", "list-units", "--type=service", "--no-legend", "--no-pager"]
+        if states:
+            base += ["--state=" + ",".join(states)]
+        try:
+            out = subprocess.run(base, check=True, stdout=subprocess.PIPE, text=True).stdout
+        except Exception as e:
+            self.notify(f"systemctl error: {e}", severity="error")
+            return []
+        rows: list[ServiceRow] = []
+        for line in out.splitlines():
+            # Format typique: UNIT LOAD ACTIVE SUB DESCRIPTION
+            # ex: "sshd.service loaded active running OpenSSH Daemon"
+            parts = line.split(None, 4)
+            if len(parts) < 5:
+                continue
+            unit, _load, _active, sub, desc = parts
+            state = f"{_active}/{sub}"
+            rows.append(ServiceRow(state=state, unit=unit, description=desc))
+        return rows
+
+    def _uptime_hms(self) -> str:
+        if psutil:
+            boot = psutil.boot_time()
+            secs = int(time.time() - boot)
+        else:
+            # fallback /proc/uptime
+            try:
+                with open("/proc/uptime", "r") as f:
+                    secs = int(float(f.read().split()[0]))
+            except Exception:
+                secs = 0
+        h, rem = divmod(secs, 3600)
+        m, s = divmod(rem, 60)
+        return f"{h:d}h{m:02d}m{s:02d}s"
+
+    def _fmt_bytes(self, n: int) -> str:
+        # IEC units
+        for unit in ("B","KiB","MiB","GiB","TiB","PiB"):
+            if n < 1024 or unit == "PiB":
+                return f"{n:.1f} {unit}"
+            n /= 1024.0
+        return f"{n:.1f} PiB"
+
+    def _cpu_percent_fallback(self) -> float:
+        # estimation grossière via /proc/stat (delta sur 100ms)
+        try:
+            def snap():
+                with open("/proc/stat") as f:
+                    cpu = next(line for line in f if line.startswith("cpu "))
+                fields = list(map(int, cpu.split()[1:8]))
+                user, nice, system, idle, iowait, irq, softirq = fields
+                busy = user + nice + system + irq + softirq
+                total = busy + idle + iowait
+                return busy, total
+            b1, t1 = snap()
+            time.sleep(0.1)
+            b2, t2 = snap()
+            db, dt = b2 - b1, t2 - t1
+            return (100.0 * db / dt) if dt > 0 else 0.0
+        except Exception:
+            return 0.0
