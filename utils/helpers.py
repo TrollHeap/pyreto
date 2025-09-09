@@ -5,7 +5,6 @@ import textwrap
 import subprocess
 from datetime import datetime
 from pathlib import Path
-from typing import Union
 
 
 def run_cmd(cmd: list[str], *, cwd: Path | None = None) -> str:
@@ -35,8 +34,6 @@ def create_exercise_files(ex_dir: Path, date_str: str, n: int, content: str | No
     paths: list[Path] = []
     chunks: list[str] = []
     if content:
-        # Découpe sur titres Markdown: "### EX01 — ..."
-        parts = re.split(r'(?m)^(?:#{1,6}\s*)?EX\d{2}\b|^(?:#{1,6}\s*)?###\s+EX\d{2}\b', "\n" + content)
         # La regex ci-dessus peut avaler le préfixe; on re-split proprement si besoin :
         chunks = [c.strip() for c in re.findall(r'(?ms)^(?:#{1,6}\s*)?###?\s*EX\d{2}\b.*?(?=^(?:#{1,6}\s*)?###?\s*EX\d{2}\b|\Z)', content)]
     for i in range(1, n + 1):
@@ -48,13 +45,13 @@ def create_exercise_files(ex_dir: Path, date_str: str, n: int, content: str | No
         else:
             skeleton = textwrap.dedent(f"""\
             ### EX{i:02d} — [Titre court façon mission]
-            **Objectif (1 phrase) :**  
+            **Objectif (1 phrase) :**
             [ce que le héros doit accomplir]
 
-            **Contexte (3–6 lignes) :**  
+            **Contexte (3–6 lignes) :**
             [scénario ludique + contrainte réaliste]
 
-            **Type :** [GÉNÉRATION|DIAGNOSTIC|TRANSFORMATION|COMPARAISON|STRESS TEST]  
+            **Type :** [GÉNÉRATION|DIAGNOSTIC|TRANSFORMATION|COMPARAISON|STRESS TEST]
             **Ressources :** [autorisées/interdites]
 
             **Entrée :**

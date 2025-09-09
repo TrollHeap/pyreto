@@ -14,8 +14,10 @@ from rich import box
 
 from api.openai import OpenAIResponder, OpenAIConfig
 
+
 class RichUI:
     """Toutes les interactions Rich sont ici. Une seule Console, injectée."""
+
     def __init__(self, console: Console) -> None:
         self.console = console
 
@@ -83,7 +85,8 @@ class RichUI:
     def show_exercises_created(self, paths: list[Path], launcher: Optional[Path]) -> None:
         table = Table(title="Exercices créés", box=box.SIMPLE)
         table.add_column("Fichier", style="cyan")
-        for p in paths: table.add_row(str(p))
+        for p in paths:
+            table.add_row(str(p))
         self.console.print(table)
         if launcher:
             self.console.print(f"[green]Lanceur:[/green] {launcher}")
@@ -109,7 +112,8 @@ class RichUI:
             self.console.print("[yellow]Aucun planning détecté (pas d'exercices datés).[/yellow]")
             return
         table = Table(title=f"Planning (approx.) pour '{slug}'", box=box.MINIMAL_DOUBLE_HEAD)
-        table.add_column("Date", style="green"); table.add_column("Exercices")
+        table.add_column("Date", style="green")
+        table.add_column("Exercices")
         for day, names in schedule:
             table.add_row(day, ", ".join(names))
         self.console.print(table)
@@ -129,5 +133,6 @@ class RichUI:
         return files[idx - 1]
 
     def open_in_editor(self, path: Path) -> None:
-        import os, subprocess
+        import os
+        import subprocess
         subprocess.run([os.environ.get("EDITOR", "vi"), str(path)])
