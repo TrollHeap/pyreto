@@ -8,11 +8,12 @@ import os
 class ModelOPENAI(Enum):
     GPT_5 = "gpt-5"
     GPT_5_MINI = "gpt-5-mini"
+    GPT_5_NANO = "gpt-5-nano"
 
 
 @dataclass
 class OpenAIConfig:
-    model: str = ModelOPENAI.GPT_5
+    model: str = ModelOPENAI.GPT_5_NANO
     prompt_id: str | None = None
     prompt_version: str | None = None
     prompt_vars: dict | None = None
