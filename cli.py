@@ -1,145 +1,199 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import argparse
-import json
-import sys
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
 
 from rich.console import Console
+from rich.text import Text
 
-from api.openai import OpenAIResponder, OpenAIConfig
-from core import ParetoLearningSystem
-from rich_ui.ui_rich import RichUI
-from utils.helpers import safe_slug  # utilisé par l’option 6
+from menu import MenuChoice, parse_menu_choice
+from views.ui import RichUI
+from views.course_view import CourseView
+from views.topics_view import TopicsView
+from views.schedule_view import ScheduleView
+from controllers.course_controller import CourseController
+from controllers.topics_controller import TopicsController
+from controllers.schedule_controller import ScheduleController
 
-PATH_DIR = "Developer/exercise/pareto"
+from services.openai_factory import build_openai_client
+from services.cheatsheet_service import generate_cheatsheet
+from services.exercises_service import generate_exercises
+from utils.helpers import safe_slug  # pour afficher/normaliser le topic
 
-
-def build_client_from_args(args: argparse.Namespace) -> Optional[OpenAIResponder]:
-    """Construit le client OpenAI depuis les args; retourne None si config incomplète/incorrecte."""
-    try:
-        prompt_vars = json.loads(args.prompt_vars) if args.prompt_vars else None
-    except json.JSONDecodeError:
-        return None
-
-    try:
-        return OpenAIResponder(OpenAIConfig(
-            model=args.model,
-            instructions=args.instructions,
-            prompt_id=args.prompt_id,
-            prompt_version=args.prompt_version,
-            prompt_vars=prompt_vars,
-        ))
-    except Exception:
-        # On laisse l’UI proposer une config interactive si besoin
-        return None
+PATH_DIR = "Developer/exercise/pyreto"  # ajuste si besoin
 
 
-def run_interactive(ui: RichUI, base_dir: Path, client: Optional[OpenAIResponder]) -> int:
-    """Boucle de menu interactive."""
-    # Configuration client si absente
-    if client is None:
-        client = ui.ask_openai_client()
+@dataclass
+class AppState:
+    base: Path
+    client: object | None = None
+    last_topic: str | None = None
+    recent_topics: list[str] = field(default_factory=list)
+    last_action: str | None = None  # "course" | "cheat" | "ex"
 
-    system = ParetoLearningSystem(base_dir=base_dir, client=client)
+    def remember_topic(self, topic: str) -> None:
+        topic = topic.strip()
+        if not topic:
+            return
+        self.last_topic = topic
+        if topic in self.recent_topics:
+            self.recent_topics.remove(topic)
+        self.recent_topics.insert(0, topic)
+        del self.recent_topics[5:]
 
+
+def parse_args() -> argparse.Namespace:
+    ap = argparse.ArgumentParser(description="Pareto Learning (refactor MVC-S)")
+    ap.add_argument("topic", nargs="?", help="Sujet à apprendre (ex: awk)")
+    ap.add_argument("-n", "--num-ex", type=int, default=5, help="Nombre d'exercices (défaut: 5)")
+    ap.add_argument("-b", "--base-dir", type=Path, default=Path.home() / PATH_DIR,
+                    help="Répertoire racine des sujets")
+    ap.add_argument("--non-interactif", action="store_true",
+                    help="Mode non interactif : génère le cours pour <topic> et quitte")
+    return ap.parse_args()
+
+
+def _ask_topic(ui: RichUI, state: AppState, prompt: str = "Sujet (slug)") -> str:
+    default = state.last_topic or (state.recent_topics[0] if state.recent_topics else "memory")
+    topic = ui.ask_text(f"{prompt} ({default})", default).strip()
+    if topic:
+        state.remember_topic(topic)
+    return topic
+
+
+def _header(ui: RichUI, state: AppState) -> None:
+    recent = ", ".join(state.recent_topics[:3]) or "-"
+    cur = state.last_topic or "-"
+    ui.console.rule(Text(f"Menu — topic courant: {cur}  |  récents: {recent}", style="cyan"))
+
+
+def run_interactive(ui: RichUI, state: AppState) -> int:
+    """
+    Boucle interactive avec handlers complets pour 1/2/3 et préviews.
+    Raccourcis: g=cheat, x=exos, r=répéter dernière action, t=changer topic, ?=aide.
+    """
+    shortcuts = {"g": MenuChoice.CHEATSHEET, "x": MenuChoice.EXERCISES}
     while True:
-        choice = ui.show_menu()
-        if choice == "7":
+        _header(ui, state)
+        raw = ui.show_menu().strip()
+        if raw in shortcuts:
+            choice = shortcuts[raw]
+        elif raw == "r" and state.last_action:
+            # replique la dernière action sur last_topic
+            choice = {
+                "course": MenuChoice.COURSE,
+                "cheat": MenuChoice.CHEATSHEET,
+                "ex": MenuChoice.EXERCISES,
+            }.get(state.last_action, MenuChoice.QUIT)
+        elif raw == "t":
+            _ask_topic(ui, state, "Nouveau sujet (slug)")
+            continue
+        elif raw == "?":
+            ui.console.print("[bold]Raccourcis:[/bold] g=cheat, x=exos, r=répéter, t=changer sujet, q=quitter")
+            continue
+        elif raw == "q":
+            choice = MenuChoice.QUIT
+        else:
+            choice = parse_menu_choice(raw)
+
+        if choice is MenuChoice.QUIT:
             ui.console.print("[bold]Au revoir! 👋[/bold]")
             return 0
 
-        # Les options qui nécessitent un sujet
-        if choice in {"1", "2", "3", "4", "6"}:
-            topic = ui.ask_text("Sujet ?")
+        # Handlers
+        if choice is MenuChoice.COURSE:
+            topic = _ask_topic(ui, state)
             if not topic:
-                ui.console.print("[red]Sujet vide — opération annulée.[/red]")
+                ui.console.print("[red]Sujet vide — annulé.[/red]")
                 continue
+            controller = CourseController(ui, CourseView(ui), client=state.client)
+            controller.run(state.base, topic)
+            state.last_action = "course"
 
-        if choice == "1":
-            n = ui.ask_int("Combien d'exercices ?", 5)
-            with ui.spinner("Génération du cours…") as p:
-                p.add_task("gen", total=None)
-                result = system.auto_generate_full_course(topic, n=n)
-            ui.show_course_summary(result["cheatsheet"], result["ex_dir"], result["manifest"])
+        elif choice is MenuChoice.CHEATSHEET:
+            topic = _ask_topic(ui, state)
+            if not topic:
+                ui.console.print("[red]Sujet vide — annulé.[/red]")
+                continue
+            with ui.spinner("Génération cheat sheet…"):
+                path = generate_cheatsheet(state.base, topic, client=state.client)
+            ui.console.print(f"[green]Cheat sheet:[/green] {path}")
+            ui.preview_markdown(path, limit_chars=1800)
+            if ui.ask_confirm("Ouvrir dans l'éditeur ?", True):
+                # utilitaire minimal, ou EditorLauncher si tu l’as
+                import os
+                import subprocess
+                subprocess.run([os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vi", str(path)])
+            state.last_action = "cheat"
 
-        elif choice == "2":
-            with ui.spinner("Cheat sheet…") as p:
-                p.add_task("gen", total=None)
-                path = system.generate_cheatsheet(topic)
-            ui.show_cheatsheet_created(path)
+        elif choice is MenuChoice.EXERCISES:
+            topic = _ask_topic(ui, state)
+            if not topic:
+                ui.console.print("[red]Sujet vide — annulé.[/red]")
+                continue
+            n = ui.ask_int("Combien d'exercices ?", 5, minimum=1, maximum=50)
+            with ui.spinner("Génération exercices…"):
+                files, launcher = generate_exercises(state.base, topic, n=n, client=state.client)
+            count = len(files)
+            ui.console.print(f"[green]{count} fichier(s) créé(s)[/green] dans {files[0].parent if files else '(aucun)'}")
+            if launcher:
+                ui.console.print(f" Lanceur: {launcher}")
+            # Choix d’un exercice à ouvrir
+            if files and ui.ask_confirm("Prévisualiser un exercice ?", True):
+                pick = ui.pick_exercise(files)
+                if pick:
+                    import os
+                    import subprocess
+                    subprocess.run([os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vi", str(pick)])
+            state.last_action = "ex"
 
-        elif choice == "3":
-            n = ui.ask_int("Combien d'exercices ?", 5)
-            with ui.spinner("Exercices…") as p:
-                p.add_task("gen", total=None)
-                files, launcher = system.generate_exercises(topic, n)
-            ui.show_exercises_created(files, launcher)
+        elif choice is MenuChoice.TOPICS:
+            TopicsController(ui, TopicsView(ui)).run(state.base)
 
-        elif choice == "4":
-            ctx = system.practice_context(topic)
-            cheat = ctx.get("cheatsheet")
-            files = ctx.get("files", [])
-            mode = ui.ask_text("Mode (g=guidé, e=examen)", "g")
-            if mode == "g" and cheat:
-                ui.preview_markdown(cheat)
-            pick = ui.pick_exercise(files)
-            if pick:
-                ui.open_in_editor(pick)
+        elif choice is MenuChoice.SCHEDULE:
+            topic = _ask_topic(ui, state)
+            if not topic:
+                ui.console.print("[red]Sujet vide — annulé.[/red]")
+                continue
+            ex_dir = state.base / "exercises" / safe_slug(topic)
+            ScheduleController(ui, ScheduleView(ui)).run(ex_dir, topic)
 
-        elif choice == "5":
-            ui.show_topics(system.list_topics())
-
-        elif choice == "6":
-            sched = system.review_schedule(topic)
-            ui.show_schedule(sched, safe_slug(topic))
+        elif choice is MenuChoice.PRACTICE:
+            ui.console.print("[yellow]Mode pratique : handler à implémenter (prochaine étape).[/yellow]")
 
         else:
-            ui.console.print("[yellow]Choix invalide.[/yellow]")
+            ui.console.print("[yellow]Choix non pris en charge.[/yellow]")
+
+
+def run_non_interactive(ui: RichUI, state: AppState, topic: str, num_ex: int) -> int:
+    # équivalent “cours complet” non interactif
+    from services.course_service import generate_course
+    if not topic.strip():
+        ui.console.print("[red]Topic manquant en mode non interactif.[/red]")
+        return 2
+    with ui.spinner("Génération du cours…"):
+        result = generate_course(state.base, topic, client=state.client)
+    CourseView(ui).show_created(result["cheatsheet"], result["ex_dir"], result.get("manifest"))
+    return 0
 
 
 def main() -> int:
-    console = Console()                # une seule instance
-    ui = RichUI(console)               # injectée dans l’UI
+    args = parse_args()
+    ui = RichUI(Console())
+    client = build_openai_client(ui)  # Optional
 
-    home = Path.home()
-    default_base = home / PATH_DIR
+    state = AppState(base=args.base_dir, client=client)
 
-    ap = argparse.ArgumentParser(description="Pareto Learning (OpenAI)")
-    ap.add_argument("topic", nargs="?", help="Sujet à apprendre (ex: awk)")
-    ap.add_argument("-n", "--num-ex", type=int, default=5, help="Nombre d'exercices (défaut: 5)")
-    ap.add_argument("-b", "--base-dir", type=Path, default=default_base)
-    ap.add_argument("--model", default="gpt-5")
-    ap.add_argument("--instructions", default="Tu es concis, précis, et technique.")
-    ap.add_argument("--prompt-id")
-    ap.add_argument("--prompt-version")
-    ap.add_argument("--prompt-vars")
-    args = ap.parse_args()
+    if args.non_interactif:
+        if not args.topic:
+            ui.console.print("[red]--non-interactif exige un <topic>.[/red]")
+            return 2
+        return run_non_interactive(ui, state, args.topic, args.num_ex)
 
-    client = build_client_from_args(args)
-
-    # Mode interactif si aucun topic n’est fourni
-    if args.topic is None and len(sys.argv) == 1:
-        return run_interactive(ui, args.base_dir, client)
-
-    # Mode non interactif
-    topic = (args.topic or "").strip()
-    if not topic:
-        ui.console.print("[red]Topic manquant en mode non interactif.[/red]")
-        return 2
-
-    if client is None:
-        # Fallback : demande la config si l’utilisateur lance sans client valide
-        client = ui.ask_openai_client()
-
-    system = ParetoLearningSystem(base_dir=args.base_dir, client=client)
-    with ui.spinner("Génération du cours…") as p:
-        p.add_task("gen", total=None)
-        result = system.auto_generate_full_course(topic, n=args.num_ex)
-    ui.show_course_summary(result["cheatsheet"], result["ex_dir"], result["manifest"])
-    return 0
+    return run_interactive(ui, state)
 
 
 if __name__ == "__main__":
