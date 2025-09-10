@@ -2,7 +2,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 from rich.text import Text
-from views.ui import RichUI
+from views.rich_ui import RichUI
 
 PATH_DIR = "Developer/exercise/pyreto"
 

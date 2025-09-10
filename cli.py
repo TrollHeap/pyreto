@@ -6,7 +6,7 @@ from pathlib import Path
 from rich.console import Console
 
 from menu import MenuChoice, parse_menu_choice
-from views.ui import RichUI
+from views.rich_ui import RichUI
 from services.openai_factory import build_openai_client
 from app_state import AppState, PATH_DIR, header, ask_topic
 from handlers import (

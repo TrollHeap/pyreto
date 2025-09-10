@@ -11,8 +11,6 @@ from services.cheatsheet_service import generate_cheatsheet
 from services.exercises_service import generate_exercises
 from utils.helpers import safe_slug
 
-# petit utilitaire local
-
 
 def _open_in_editor(path: Path) -> None:
     import os

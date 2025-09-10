@@ -9,4 +9,4 @@ class CourseController:
 
     def run(self, base: Path, slug: str):
         result = generate_course(base, slug, client=self.client)
-        self.view.show_created(result["cheatsheet"], result["ex_dir"], result.get("manifest"))
+        self.view.show_created(result["cheatsheet"], result["ex_dir"])
