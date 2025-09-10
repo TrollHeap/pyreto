@@ -1,4 +1,3 @@
-# controllers/course_controller.py
 from pathlib import Path
 from services.course_service import generate_course
 
