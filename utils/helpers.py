@@ -1,9 +1,7 @@
 import os
 import re
-import json
 import textwrap
 import subprocess
-from datetime import datetime
 from pathlib import Path
 
 
@@ -107,27 +105,3 @@ def create_launcher_script(ex_dir: Path, topic_slug: str) -> Path:
     write_text(sh, content)
     sh.chmod(0o755)
     return sh
-
-
-def write_manifest(base: Path, topic: str, topic_slug: str, cheats: Path, ex_files: list[Path]) -> Path:
-    manifest_dir = base / topic_slug
-    manifest_dir.mkdir(parents=True, exist_ok=True)
-    manifest_path = manifest_dir / "manifest.json"
-
-    record = {
-        "topic": topic,
-        "topic_slug": topic_slug,
-        "created_at": datetime.now().isoformat(timespec="seconds"),
-        "cheatsheet": str((base / "cheatsheets" / topic_slug / f"{topic_slug}.md").expanduser()),
-        "exercises": [str(p.with_suffix(".md").expanduser()) for p in ex_files],
-    }
-
-    existing = {}
-    if manifest_path.exists():
-        try:
-            existing = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except Exception:
-            existing = {}
-    existing[topic_slug] = record
-    write_text(manifest_path, json.dumps(existing, indent=2, ensure_ascii=False) + "\n")
-    return manifest_path
