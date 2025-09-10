@@ -8,6 +8,5 @@ class CourseController:
         self.ui, self.view, self.client = ui, view, client
 
     def run(self, base: Path, slug: str):
-        with self.ui.spinner("Génération du cours…"):
-            result = generate_course(base, slug, client=self.client)
-        self.view.show_created(result["cheatsheet"], result["ex_dir"])
+        result = generate_course(base, slug, client=self.client)
+        self.view.show_created(result["cheatsheet"], result["ex_dir"], result.get("manifest"))
