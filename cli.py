@@ -18,7 +18,7 @@ from handlers import (
 
 
 def parse_args() -> argparse.Namespace:
-    ap = argparse.ArgumentParser(description="Pareto Learning (MVC-S) — mode interactif")
+    ap = argparse.ArgumentParser(description="Pyreto Learning (MVC-S)")
     ap.add_argument(
         "-b", "--base-dir",
         type=Path,
@@ -134,7 +134,6 @@ def main() -> int:
     args = parse_args()
     ui = RichUI(Console())
 
-    # Lazy: on ne crée le client OpenAI que si l'utilisateur le souhaite
     client = build_openai_client(ui)
     state = AppState(base=args.base_dir, client=client)
 
