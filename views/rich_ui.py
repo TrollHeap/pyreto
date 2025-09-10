@@ -1,9 +1,16 @@
 from __future__ import annotations
 from contextlib import contextmanager
 from pathlib import Path
-from rich.console import Console
+
+from rich.table import Table
 from rich.panel import Panel
-from rich.prompt import Prompt, IntPrompt, Confirm
+from rich.align import Align
+from rich.text import Text
+from rich.rule import Rule
+from rich import box
+from rich.prompt import Prompt
+from rich.console import Console
+from rich.prompt import IntPrompt, Confirm
 from rich.markdown import Markdown
 from rich.progress import Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 
@@ -43,16 +50,56 @@ class RichUI:
     def ask_confirm(self, prompt: str, default: bool = True) -> bool:
         return Confirm.ask(prompt, default=default)
 
-    # Menus / écrans génériques
     def show_menu(self) -> str:
-        self.console.print(Panel.fit(
-            """[bold]🎓 SYSTÈME D'APPRENTISSAGE - LOI DE PARETO[/bold]
+        self.console.clear()
 
-1) 🚀 Cours complet  2) 📝 Cheat sheet  3) 💪 Exercices
-4) 📚 Pratiquer       5) 📊 Sujets       6) 📅 Planning
-7) ❌ Quitter
-""", border_style="cyan", title="Menu"))
-        return Prompt.ask("Votre choix (1-7)", choices=[str(i) for i in range(1, 8)], default="7")
+        # --- Header
+        title = Text("🎓 SYSTÈME D'APPRENTISSAGE — LOI DE PARETO", style="bold cyan")
+        subtitle = Text("Choisis un mode. Astuce: tape un chiffre (1–7) ou 'q' pour quitter.", style="dim")
+
+        # --- Grid (3 colonnes, 2 rangées + ligne quitter)
+        grid = Table.grid(padding=(0, 2), expand=False)
+        grid.add_column(justify="left", ratio=1)
+        grid.add_column(justify="left", ratio=1)
+        grid.add_column(justify="left", ratio=1)
+
+        grid.add_row(
+            "[bold]1)[/bold] 🚀 Cours complet",
+            "[bold]2)[/bold] 📝 Cheat sheet",
+            "[bold]3)[/bold] 💪 Exercices"
+        )
+        grid.add_row(
+            "[bold]4)[/bold] 📚 Pratiquer",
+            "[bold]5)[/bold] 📊 Sujets",
+            "[bold]6)[/bold] 📅 Planning"
+        )
+
+        quit_line = Text("7) ❌ Quitter", style="bold red")
+
+        # --- Conteneur principal
+        body = Panel.fit(
+            Align.left(grid),
+            title="Menu",
+            border_style="cyan",
+            box=box.ROUNDED,
+            padding=(1, 2)
+        )
+
+        # --- Rendu
+        self.console.print(Align.center(title))
+        self.console.print(Align.center(subtitle))
+        self.console.print(Rule(style="dim"))
+        self.console.print(Align.center(body))
+        self.console.print(Align.center(quit_line))
+        self.console.print(Rule(style="dim"))
+
+        # --- Saisie (avec alias 'q' -> '7')
+        choices = [str(i) for i in range(1, 8)] + ["q", "Q"]
+        answer = Prompt.ask("Votre choix", choices=choices, default="7")
+
+        if answer.lower() == "q":
+            return "7"
+        return answer
 
     def preview_markdown(self, path: Path, limit_chars: int = 2000) -> None:
         self.console.print(Markdown(path.read_text(encoding="utf-8")[:limit_chars]))
